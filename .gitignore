@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+*.pyc
+
+models/**/*.pt
+models/**/*.pth
+
+data/raw/*.mp4
+data/crops/
+
+outputs/
+
+.ipynb_checkpoints/
+.pytest_cache/

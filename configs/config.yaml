@@ -1,0 +1,42 @@
+detector:
+  model_path: models/detector/yolov8n.pt
+  confidence_threshold: 0.5
+  person_class_id: 0
+  device: auto
+
+tracker:
+  config_path: configs/bytetrack.yaml
+
+reid:
+  model_path: models/reid/osnet.pth
+  architecture: osnet_x1_0
+  device: auto
+  input_height: 256
+  input_width: 128
+  sample_interval: 5
+  min_crop_width: 30
+  min_crop_height: 60
+
+matching:
+  similarity_threshold: 0.70
+  max_time_gap_seconds: 30
+  use_time_constraint: true
+
+video:
+  camera_1:
+    id: cam1
+    path: data/raw/cam1.mp4
+    time_offset_seconds: 0
+  camera_2:
+    id: cam2
+    path: data/raw/cam2.mp4
+    time_offset_seconds: 0
+
+output:
+  save_crops: true
+  save_local_tracking_video: false
+  save_global_tracking_video: true
+  show_local_id: true
+  show_confidence: false
+  codec: mp4v
+  output_directory: outputs

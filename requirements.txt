@@ -1,0 +1,9 @@
+# Install a PyTorch build appropriate for your CPU/CUDA environment if needed.
+torch>=2.2,<3
+torchvision>=0.17,<1
+ultralytics>=8.3,<9
+opencv-python>=4.9,<5
+numpy>=1.26,<3
+scipy>=1.12,<2
+pandas>=2.2,<3
+PyYAML>=6.0,<7

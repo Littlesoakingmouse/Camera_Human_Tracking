@@ -1,0 +1,303 @@
+# Multi-Camera Person Tracking Baseline
+
+A complete offline baseline for tracking people within each camera and assigning the
+same **global ID** to visually matching tracks across cameras. The project is intended
+for an understandable university Computer Vision demo, not for model training or
+real-time deployment.
+
+No command in this repository downloads weights, videos, or datasets. You supply all
+three required input files locally.
+
+## Pipeline
+
+```text
+cam1.mp4 / cam2.mp4
+        |
+        v
+YOLO person detection
+        |
+        v
+ByteTrack local tracking
+        |
+        v
+sampled person crops -> OSNet embeddings
+        |
+        v
+mean + L2 normalization per local track
+        |
+        v
+cross-camera cosine similarity + time constraint
+        |
+        v
+Hungarian assignment -> conflict-safe global IDs
+        |
+        v
+CSV reports + replayed annotated videos
+```
+
+This is deliberately a three-pass design:
+
+1. Process each camera independently and build local tracks.
+2. match completed tracks across cameras and assign global IDs.
+3. Replay the videos and render the stored boxes using the global-ID mapping.
+
+## Project structure
+
+```text
+.
+|-- main.py
+|-- README.md
+|-- requirements.txt
+|-- configs/
+|   |-- config.yaml
+|   `-- bytetrack.yaml
+|-- data/
+|   |-- raw/                 # put cam1.mp4 and cam2.mp4 here
+|   `-- crops/
+|-- models/
+|   |-- detector/            # put yolov8n.pt here
+|   `-- reid/                # put osnet.pth here
+|-- scripts/
+|   |-- test_detector.py
+|   |-- test_tracker.py
+|   |-- test_reid.py
+|   `-- test_matching.py
+|-- src/
+|   |-- detector_tracker.py
+|   |-- reid.py
+|   |-- osnet.py
+|   |-- track_database.py
+|   |-- matcher.py
+|   |-- global_tracker.py
+|   |-- visualizer.py
+|   |-- pipeline.py
+|   `-- utils/
+|       |-- common.py
+|       `-- video.py
+`-- outputs/
+    |-- videos/
+    |-- crops/
+    `-- logs/
+```
+
+CSV files are created directly under `outputs/` when the pipeline runs. Empty model,
+video, and output directories are already created locally; large inputs and generated
+outputs are excluded by `.gitignore`.
+
+## Requirements and installation
+
+Use Python 3.10 or newer. Python 3.10 or 3.11 is a conservative choice for broad
+PyTorch/Ultralytics compatibility.
+
+Create and activate a virtual environment:
+
+```bash
+python -m venv .venv
+```
+
+Windows PowerShell:
+
+```powershell
+.venv\Scripts\Activate.ps1
+```
+
+Windows Command Prompt:
+
+```bat
+.venv\Scripts\activate
+```
+
+Linux/macOS:
+
+```bash
+source .venv/bin/activate
+```
+
+Install dependencies:
+
+```bash
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+For a particular CUDA version, install the matching PyTorch wheel using the command
+from the official PyTorch installer, then install this requirements file. With
+`device: auto`, the demo selects CUDA when `torch.cuda.is_available()` is true and CPU
+otherwise.
+
+The OSNet-x1.0 network definition is included in `src/osnet.py` and follows the state
+dictionary layout used by torchreid/deep-person-reid. This avoids an extra package and
+any pretrained-model download behavior. The checkpoint may be a raw state dictionary
+or contain `state_dict`, `model_state_dict`, or `model`; `module.` and `model.` prefixes
+are accepted. Classifier weights of a different size are safely ignored.
+
+## Add your files
+
+Place files at these exact default paths:
+
+```text
+models/detector/yolov8n.pt
+models/reid/osnet.pth
+data/raw/cam1.mp4
+data/raw/cam2.mp4
+```
+
+- `yolov8n.pt` must be a local Ultralytics-compatible detection checkpoint.
+- `osnet.pth` must be a torchreid/deep-person-reid-compatible OSNet-x1.0 checkpoint.
+- Videos must be readable by the codecs available to your OpenCV build.
+
+You may use different names or locations by changing `detector.model_path`,
+`reid.model_path`, and the camera `path` values in `configs/config.yaml`. Paths are
+resolved relative to the project root, so the command may be launched from a different
+working directory.
+
+## Configuration
+
+Important settings in `configs/config.yaml`:
+
+- `detector.confidence_threshold`: minimum YOLO confidence.
+- `detector.person_class_id`: `0` for person in COCO-trained YOLO models.
+- `detector.device` and `reid.device`: `auto`, `cpu`, `cuda`, or for example `cuda:0`.
+- `tracker.config_path`: local Ultralytics ByteTrack YAML.
+- `reid.sample_interval`: extract one crop/embedding every N video frames.
+- `reid.min_crop_width` / `min_crop_height`: reject tiny or invalid crops.
+- `matching.similarity_threshold`: minimum cosine similarity for a candidate match.
+- `matching.use_time_constraint`: enable or disable temporal filtering.
+- `matching.max_time_gap_seconds`: maximum gap between two non-overlapping tracks.
+- `video.*.time_offset_seconds`: added to `frame_index / FPS` for synchronization.
+- `output.save_crops`: write sampled crops under `outputs/crops/`.
+- `output.save_local_tracking_video`: also produce videos labeled only with local IDs.
+- `output.save_global_tracking_video`: produce the primary global-ID videos.
+
+For more cameras, add more entries under `video` with unique `id` values. Matching is
+run for every camera pair. Global merging prevents one identity from containing two
+tracks from the same camera.
+
+### Choosing the similarity threshold
+
+OSNet produces a feature vector for each sampled crop. Each vector is L2-normalized;
+all vectors for a local track are averaged and normalized again. Cosine similarity is
+then the dot product of two normalized track vectors. Values near 1 indicate more
+similar appearance and lower values indicate less similar appearance.
+
+The default threshold of `0.70` is only a starting point. Run `test_reid.py` on known
+same-person and different-person examples, inspect `similarity_matrix.csv`, and choose
+a threshold that separates the two distributions for your cameras. Raising the
+threshold reduces false matches but creates more unmatched identities; lowering it
+does the opposite.
+
+The time constraint uses global timestamps:
+
+```text
+global timestamp = frame index / video FPS + camera time offset
+```
+
+Overlapping track intervals have a gap of zero. Otherwise the closest interval-edge
+distance must be no greater than `max_time_gap_seconds`.
+
+## Run the validation utilities
+
+The matching test needs no models or videos and should be run first:
+
+```bash
+python scripts/test_matching.py
+```
+
+Test YOLO on the first ten frames:
+
+```bash
+python scripts/test_detector.py --camera cam1 --frames 10
+```
+
+Check how often each ByteTrack local ID persists:
+
+```bash
+python scripts/test_tracker.py --camera cam1 --frames 100
+```
+
+Test Re-ID using three person crop images that you supply:
+
+```bash
+python scripts/test_reid.py person_A_cam1.jpg person_A_cam2.jpg person_B.jpg
+```
+
+The same-person score should generally be higher than the different-person score.
+Real values depend heavily on checkpoint quality and camera domain.
+
+All scripts accept `--config PATH`; the detector/tracker scripts also accept a camera
+ID configured in the YAML.
+
+## Run the complete pipeline
+
+From the project directory:
+
+```bash
+python main.py --config configs/config.yaml
+```
+
+The application validates configured files before inference and never substitutes or
+downloads a missing model. It prints camera progress, device selection, track counts,
+global-person count, and accepted cross-camera match count.
+
+## Local IDs and global IDs
+
+ByteTrack assigns a **local ID** independently inside each camera. Therefore `cam1` ID
+3 and `cam2` ID 8 may describe the same person. OSNet and cross-camera matching merge
+those two local tracks into one **global ID**, for example GID 1. A local track without
+an accepted match receives its own global ID.
+
+## Outputs
+
+After a successful default run:
+
+```text
+outputs/
+|-- videos/
+|   |-- cam1_global_tracking.mp4
+|   `-- cam2_global_tracking.mp4
+|-- crops/
+|   `-- <camera>/track_<id>/frame_<index>.jpg
+|-- local_tracks.csv
+|-- global_tracks.csv
+`-- similarity_matrix.csv
+```
+
+`local_tracks.csv` summarizes each local trajectory and embedding count.
+`global_tracks.csv` maps every local track to a global ID; unmatched tracks have a
+blank `similarity_to_match`. `similarity_matrix.csv` is a labeled matrix across all
+local tracks. Same-camera cells and tracks without embeddings are intentionally blank.
+
+The video writer preserves each source video's FPS and frame dimensions. Colors are a
+deterministic function of identity and remain stable across frames.
+
+## Baseline limitations
+
+This baseline may fail when people wear very similar clothes, undergo severe
+occlusion, appear under drastically different viewpoints or lighting, or disappear
+for long periods. Poor synchronization and a badly chosen similarity threshold also
+produce incorrect assignments. Appearance mean-pooling ignores crop quality, and
+pairwise Hungarian matching is not a learned multi-camera association model.
+
+ByteTrack IDs can switch after long occlusion. Such a switch creates separate local
+tracks; because the global merger prohibits two tracks from the same camera in one
+identity, this baseline does not repair within-camera fragmentation.
+
+## Future work
+
+Natural extensions include camera-topology or NetworkX graphs, learned temporal
+transition constraints, quality-weighted embedding aggregation, fine-tuned Re-ID,
+three or more calibrated cameras, HOTA/IDF1 evaluation, real-time streams, and a
+FastAPI/Streamlit dashboard. Those additions are intentionally outside this clean
+offline baseline.
+
+## Troubleshooting
+
+- A missing-file error is expected until all weights/videos are placed at configured
+  paths.
+- If OpenCV cannot create MP4 output, install a build with MP4 support or change the
+  four-character `output.codec` setting to a codec supported on your machine.
+- If GPU inference fails, set both device values to `cpu` to verify the pipeline.
+- If there are no Re-ID embeddings, reduce crop size limits and confirm that ByteTrack
+  is producing IDs. The CSV `num_embeddings` column makes this visible.
+- If OSNet reports no compatible parameters, use an OSNet-x1.0 checkpoint rather than
+  weights from another OSNet width or an unrelated Re-ID architecture.
