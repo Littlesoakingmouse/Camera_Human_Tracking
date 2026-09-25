@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from .track_database import LocalTrack, TrackKey
+from .track_database import LocalTrack, TrackKey, TrackSegment
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -105,15 +105,25 @@ class CrossCameraMatcher:
         return candidates
 
 
-def similarity_dataframe(tracks: list[LocalTrack]) -> "pd.DataFrame":
-    """Build a labeled all-camera matrix; same-camera and unavailable cells are blank."""
+def similarity_dataframe(tracks: list[LocalTrack | TrackSegment], id_prefix: str = "L",
+                         include_same_camera: bool = False) -> "pd.DataFrame":
+    """Build a labeled similarity matrix; diagonal and unavailable cells are blank."""
     import pandas as pd
 
-    labels = [f"{track.camera_id}:L{track.local_track_id}" for track in tracks]
+    labels = [
+        (
+            f"{track.camera_id}:{id_prefix}{track.local_track_id}:S{track.segment_index}"
+            if isinstance(track, TrackSegment)
+            else f"{track.camera_id}:{id_prefix}{track.local_track_id}"
+        )
+        for track in tracks
+    ]
     matrix = np.full((len(tracks), len(tracks)), np.nan, dtype=np.float64)
     for row, track_a in enumerate(tracks):
         for column, track_b in enumerate(tracks):
-            if track_a.camera_id == track_b.camera_id:
+            if row == column:
+                continue
+            if not include_same_camera and track_a.camera_id == track_b.camera_id:
                 continue
             if track_a.embedding is not None and track_b.embedding is not None:
                 matrix[row, column] = cosine_similarity(track_a.embedding, track_b.embedding)

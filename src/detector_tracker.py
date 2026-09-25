@@ -36,6 +36,9 @@ class DetectorTracker:
         self.model_path = project_path(config, detector_cfg["model_path"])
         self.tracker_path = project_path(config, config["tracker"]["config_path"])
         self.confidence = float(detector_cfg["confidence_threshold"])
+        self.iou_threshold = float(detector_cfg.get("iou_threshold", 0.60))
+        if not 0.0 <= self.iou_threshold <= 1.0:
+            raise ProjectError("detector.iou_threshold must be between 0 and 1.")
         self.person_class_id = int(detector_cfg["person_class_id"])
         self.device = select_device(detector_cfg.get("device", "auto"))
         self._validate_files()
@@ -79,7 +82,8 @@ class DetectorTracker:
     def detect_frame(self, frame: np.ndarray) -> list[Detection]:
         """Detect people in one BGR frame without updating tracker state."""
         result = self.model.predict(
-            source=frame, conf=self.confidence, classes=[self.person_class_id],
+            source=frame, conf=self.confidence, iou=self.iou_threshold,
+            classes=[self.person_class_id],
             device=str(self.device), verbose=False
         )[0]
         boxes = result.boxes
@@ -105,6 +109,7 @@ class DetectorTracker:
             persist=True,
             tracker=str(self.tracker_path),
             conf=self.confidence,
+            iou=self.iou_threshold,
             classes=[self.person_class_id],
             device=str(self.device),
             verbose=False,

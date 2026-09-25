@@ -11,7 +11,7 @@ three required input files locally.
 ## Pipeline
 
 ```text
-cam1.mp4 / cam2.mp4
+configured camera videos
         |
         v
 YOLO person detection
@@ -26,6 +26,9 @@ sampled person crops -> OSNet embeddings
 mean + L2 normalization per local track
         |
         v
+same-camera tracklet stitching -> stable camera IDs (CID)
+        |
+        v
 cross-camera cosine similarity + time constraint
         |
         v
@@ -37,9 +40,10 @@ CSV reports + replayed annotated videos
 
 This is deliberately a three-pass design:
 
-1. Process each camera independently and build local tracks.
-2. match completed tracks across cameras and assign global IDs.
-3. Replay the videos and render the stored boxes using the global-ID mapping.
+1. Process each camera independently and build raw ByteTrack local tracks.
+2. Stitch non-overlapping same-camera tracklets into stable camera identities (CID),
+   then match those identities across cameras and assign global IDs.
+3. Replay the videos and render the stored boxes using the CID/GID mappings.
 
 ## Project structure
 
@@ -52,10 +56,10 @@ This is deliberately a three-pass design:
 |   |-- config.yaml
 |   `-- bytetrack.yaml
 |-- data/
-|   |-- raw/                 # put cam1.mp4 and cam2.mp4 here
+|   |-- raw/                 # put configured camera videos here
 |   `-- crops/
 |-- models/
-|   |-- detector/            # put yolov8n.pt here
+|   |-- detector/            # put yolo26m.pt here
 |   `-- reid/                # put osnet_ain_x1_0.pth here
 |-- scripts/
 |   |-- test_detector.py
@@ -68,6 +72,7 @@ This is deliberately a three-pass design:
 |   |-- osnet.py
 |   |-- osnet_ain.py
 |   |-- track_database.py
+|   |-- intra_camera_matcher.py
 |   |-- matcher.py
 |   |-- global_tracker.py
 |   |-- visualizer.py
@@ -140,13 +145,13 @@ Classifier weights of a different size are safely ignored.
 Place files at these exact default paths:
 
 ```text
-models/detector/yolov8n.pt
+models/detector/yolo26m.pt
 models/reid/osnet_ain_x1_0.pth
-data/raw/cam1.mp4
-data/raw/cam2.mp4
+data/raw/video3_1.avi
+data/raw/video3_2.avi
 ```
 
-- `yolov8n.pt` must be a local Ultralytics-compatible detection checkpoint.
+- `yolo26m.pt` must be a local Ultralytics-compatible detection checkpoint.
 - `osnet_ain_x1_0.pth` must be a torchreid/deep-person-reid-compatible
   OSNet-AIN-x1.0 checkpoint. A regular OSNet-x1.0 checkpoint is not interchangeable.
 - Videos must be readable by the codecs available to your OpenCV build.
@@ -166,6 +171,11 @@ Important settings in `configs/config.yaml`:
 - `tracker.config_path`: local Ultralytics ByteTrack YAML.
 - `reid.sample_interval`: extract one crop/embedding every N video frames.
 - `reid.min_crop_width` / `min_crop_height`: reject tiny or invalid crops.
+- `intra_camera.enabled`: enable or disable same-camera tracklet stitching.
+- `intra_camera.similarity_threshold`: minimum appearance similarity for re-entry.
+- `intra_camera.max_time_gap_seconds`: maximum time between same-camera segments.
+- `intra_camera.time_penalty_weight`: prefer closer re-entries when appearance ties.
+- `intra_camera.min_embeddings`: minimum descriptors required before stitching a track.
 - `matching.similarity_threshold`: minimum cosine similarity for a candidate match.
 - `matching.use_time_constraint`: enable or disable temporal filtering.
 - `matching.max_time_gap_seconds`: maximum gap between two non-overlapping tracks.
@@ -185,7 +195,7 @@ all vectors for a local track are averaged and normalized again. Cosine similari
 then the dot product of two normalized track vectors. Values near 1 indicate more
 similar appearance and lower values indicate less similar appearance.
 
-The default threshold of `0.70` is only a starting point. Run `test_reid.py` on known
+The configured cross-camera threshold is only a starting point. Run `test_reid.py` on known
 same-person and different-person examples, inspect `similarity_matrix.csv`, and choose
 a threshold that separates the two distributions for your cameras. Raising the
 threshold reduces false matches but creates more unmatched identities; lowering it
@@ -220,6 +230,12 @@ Check how often each ByteTrack local ID persists:
 python scripts/test_tracker.py --camera cam1 --frames 100
 ```
 
+Test same-camera re-entry stitching without loading models or videos:
+
+```bash
+python scripts/test_intra_camera.py
+```
+
 Test Re-ID using three person crop images that you supply:
 
 ```bash
@@ -244,12 +260,13 @@ The application validates configured files before inference and never substitute
 downloads a missing model. It prints camera progress, device selection, track counts,
 global-person count, and accepted cross-camera match count.
 
-## Local IDs and global IDs
+## Local IDs, camera IDs, and global IDs
 
 ByteTrack assigns a **local ID** independently inside each camera. Therefore `cam1` ID
-3 and `cam2` ID 8 may describe the same person. OSNet and cross-camera matching merge
-those two local tracks into one **global ID**, for example GID 1. A local track without
-an accepted match receives its own global ID.
+3 and a later `cam1` ID 12 may be two visits by the same person. Same-camera stitching
+can map both tracklets to one stable **camera person ID (CID)**. OSNet and cross-camera
+matching then merge CIDs from different cameras into one **global ID (GID)**. A CID
+without an accepted cross-camera match receives its own GID.
 
 ## Outputs
 
@@ -263,14 +280,23 @@ outputs/
 |-- crops/
 |   `-- <camera>/track_<id>/frame_<index>.jpg
 |-- local_tracks.csv
+|-- camera_tracks.csv
+|-- intra_camera_matches.csv
 |-- global_tracks.csv
+|-- local_similarity_matrix.csv
 `-- similarity_matrix.csv
 ```
 
-`local_tracks.csv` summarizes each local trajectory and embedding count.
-`global_tracks.csv` maps every local track to a global ID; unmatched tracks have a
-blank `similarity_to_match`. `similarity_matrix.csv` is a labeled matrix across all
-local tracks. Same-camera cells and tracks without embeddings are intentionally blank.
+`local_tracks.csv` summarizes each raw LID, its assigned CID, embedding count, and
+same-camera stitch similarity. `camera_tracks.csv` summarizes each stable CID and lists
+the source LIDs joined into it. `intra_camera_matches.csv` records every accepted
+same-camera link with its appearance similarity, time gap, and final score.
+`global_tracks.csv` maps every raw LID through its CID to a GID; unmatched CIDs have
+a blank `similarity_to_match`.
+`local_similarity_matrix.csv` contains diagnostic similarities between raw LIDs,
+including same-camera pairs used by the stitching stage.
+`similarity_matrix.csv` contains the CID similarities actually used for cross-camera
+matching. Same-camera cells and identities without embeddings are intentionally blank.
 
 The video writer preserves each source video's FPS and frame dimensions. Colors are a
 deterministic function of identity and remain stable across frames.
@@ -283,9 +309,10 @@ for long periods. Poor synchronization and a badly chosen similarity threshold a
 produce incorrect assignments. Appearance mean-pooling ignores crop quality, and
 pairwise Hungarian matching is not a learned multi-camera association model.
 
-ByteTrack IDs can switch after long occlusion. Such a switch creates separate local
-tracks; because the global merger prohibits two tracks from the same camera in one
-identity, this baseline does not repair within-camera fragmentation.
+ByteTrack IDs can still switch after occlusion. The stitching stage repairs a switch
+only when the segments do not overlap, fall within the configured time gap, contain
+enough embeddings, and exceed the same-camera similarity threshold. Similar clothing
+can still cause a false stitch; calibrated entry/exit zones are a useful future signal.
 
 ## Future work
 

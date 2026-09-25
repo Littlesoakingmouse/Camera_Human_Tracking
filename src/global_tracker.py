@@ -17,7 +17,7 @@ class GlobalAssignment:
 
 
 class GlobalTracker:
-    """Merge match edges while ensuring one local track per camera per identity."""
+    """Merge match edges while ensuring one camera identity per camera per GID."""
 
     def assign(self, tracks: list[LocalTrack], matches: list[CandidateMatch]) -> GlobalAssignment:
         keys = [track.key for track in tracks]

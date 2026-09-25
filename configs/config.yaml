@@ -1,6 +1,9 @@
 detector:
   model_path: models/detector/yolo26m.pt
-  confidence_threshold: 0.5
+  # Keep low-confidence boxes available for ByteTrack's second association stage.
+  confidence_threshold: 0.1
+  # Suppress duplicate person boxes such as the 0.68-IoU pair observed in cam5.
+  iou_threshold: 0.60
   person_class_id: 0
   device: auto
 
@@ -16,6 +19,30 @@ reid:
   sample_interval: 5
   min_crop_width: 30
   min_crop_height: 60
+
+tracklet_split:
+  enabled: true
+  window_size: 4
+  change_similarity_threshold: 0.65
+  min_separation_frames: 20
+  min_segment_embeddings: 4
+  outlier_similarity_threshold: 0.55
+
+intra_camera:
+  enabled: true
+  # Same-camera appearance is more consistent than cross-camera appearance.
+  similarity_threshold: 0.78
+  max_time_gap_seconds: 120
+  # Prefer a closer re-entry when appearance scores are nearly equal.
+  time_penalty_weight: 0.05
+  min_embeddings: 2
+  duplicate_similarity_threshold: 0.82
+  duplicate_iou_threshold: 0.60
+  duplicate_frame_ratio_threshold: 0.70
+  duplicate_center_distance_ratio: 0.25
+  duplicate_max_overlap_frames: 45
+  duplicate_max_overlap_ratio: 0.30
+  duplicate_min_shared_frames: 2
 
 matching:
   similarity_threshold: 0.6654
@@ -48,6 +75,7 @@ output:
   save_crops: true
   save_local_tracking_video: false
   save_global_tracking_video: true
+  show_camera_id: true
   show_local_id: true
   show_confidence: false
   codec: mp4v
