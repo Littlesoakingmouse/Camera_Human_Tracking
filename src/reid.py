@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from .osnet import osnet_x1_0
+from .osnet_ain import osnet_ain_x1_0
 from .utils.common import ProjectError, l2_normalize, project_path, select_device
 
 
@@ -22,16 +23,24 @@ class ReIDModel:
         self.device = select_device(cfg.get("device", "auto"))
         self.input_height = int(cfg.get("input_height", 256))
         self.input_width = int(cfg.get("input_width", 128))
-        architecture = cfg.get("architecture", "osnet_x1_0")
-        if architecture != "osnet_x1_0":
-            raise ProjectError(f"Unsupported Re-ID architecture: {architecture}")
+        self.architecture = str(cfg.get("architecture", "osnet_x1_0"))
+        factories = {
+            "osnet_x1_0": osnet_x1_0,
+            "osnet_ain_x1_0": osnet_ain_x1_0,
+        }
+        if self.architecture not in factories:
+            supported = ", ".join(sorted(factories))
+            raise ProjectError(
+                f"Unsupported Re-ID architecture: {self.architecture}. "
+                f"Supported values: {supported}"
+            )
         if not self.model_path.is_file():
             raise ProjectError(
                 f"OSNet model not found:\n{self.model_path}\n\n"
                 "Please place your OSNet weights at this location or update "
                 "reid.model_path in config.yaml."
             )
-        self.model = osnet_x1_0(num_classes=1)
+        self.model = factories[self.architecture](num_classes=1)
         self._load_weights()
         self.model.to(self.device).eval()
 
@@ -68,7 +77,7 @@ class ReIDModel:
         loaded_backbone = sum(key in compatible for key in backbone_keys)
         if loaded_backbone < int(0.8 * len(backbone_keys)):
             raise ProjectError(
-                "The checkpoint is not a compatible torchreid/deep-person-reid OSNet-x1.0 "
+                f"The checkpoint is not compatible with {self.architecture} "
                 f"model (loaded {loaded_backbone}/{len(backbone_keys)} backbone tensors)."
             )
         self.model.load_state_dict(compatible, strict=False)

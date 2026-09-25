@@ -1,5 +1,5 @@
 detector:
-  model_path: models/detector/yolov8n.pt
+  model_path: models/detector/yolo26m.pt
   confidence_threshold: 0.5
   person_class_id: 0
   device: auto
@@ -8,8 +8,8 @@ tracker:
   config_path: configs/bytetrack.yaml
 
 reid:
-  model_path: models/reid/osnet.pth
-  architecture: osnet_x1_0
+  model_path: models/reid/osnet_ain_x1_0.pth
+  architecture: osnet_ain_x1_0
   device: auto
   input_height: 256
   input_width: 128
@@ -18,18 +18,30 @@ reid:
   min_crop_height: 60
 
 matching:
-  similarity_threshold: 0.70
+  similarity_threshold: 0.6654
   max_time_gap_seconds: 30
   use_time_constraint: true
 
 video:
   camera_1:
     id: cam1
-    path: data/raw/cam1.mp4
+    path: data/raw/video3_1.avi
     time_offset_seconds: 0
   camera_2:
     id: cam2
-    path: data/raw/cam2.mp4
+    path: data/raw/video3_2.avi
+    time_offset_seconds: 0
+  camera_3:
+    id: cam3
+    path: data/raw/video3_3.avi
+    time_offset_seconds: 0
+  camera_4:
+    id: cam4
+    path: data/raw/video3_4.avi
+    time_offset_seconds: 0
+  camera_5:
+    id: cam5
+    path: data/raw/video3_5.avi
     time_offset_seconds: 0
 
 output:

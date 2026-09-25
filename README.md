@@ -56,7 +56,7 @@ This is deliberately a three-pass design:
 |   `-- crops/
 |-- models/
 |   |-- detector/            # put yolov8n.pt here
-|   `-- reid/                # put osnet.pth here
+|   `-- reid/                # put osnet_ain_x1_0.pth here
 |-- scripts/
 |   |-- test_detector.py
 |   |-- test_tracker.py
@@ -66,6 +66,7 @@ This is deliberately a three-pass design:
 |   |-- detector_tracker.py
 |   |-- reid.py
 |   |-- osnet.py
+|   |-- osnet_ain.py
 |   |-- track_database.py
 |   |-- matcher.py
 |   |-- global_tracker.py
@@ -125,11 +126,14 @@ from the official PyTorch installer, then install this requirements file. With
 `device: auto`, the demo selects CUDA when `torch.cuda.is_available()` is true and CPU
 otherwise.
 
-The OSNet-x1.0 network definition is included in `src/osnet.py` and follows the state
-dictionary layout used by torchreid/deep-person-reid. This avoids an extra package and
-any pretrained-model download behavior. The checkpoint may be a raw state dictionary
-or contain `state_dict`, `model_state_dict`, or `model`; `module.` and `model.` prefixes
-are accepted. Classifier weights of a different size are safely ignored.
+The OSNet-x1.0 and OSNet-AIN-x1.0 network definitions are included in `src/osnet.py`
+and `src/osnet_ain.py`. Both follow the state-dictionary layouts used by
+torchreid/deep-person-reid. The default configuration uses OSNet-AIN-x1.0, whose
+InstanceNorm layers generally improve cross-domain robustness. This local
+implementation avoids an extra package and any pretrained-model download behavior.
+The checkpoint may be a raw state dictionary or contain `state_dict`,
+`model_state_dict`, or `model`; `module.` and `model.` prefixes are accepted.
+Classifier weights of a different size are safely ignored.
 
 ## Add your files
 
@@ -137,13 +141,14 @@ Place files at these exact default paths:
 
 ```text
 models/detector/yolov8n.pt
-models/reid/osnet.pth
+models/reid/osnet_ain_x1_0.pth
 data/raw/cam1.mp4
 data/raw/cam2.mp4
 ```
 
 - `yolov8n.pt` must be a local Ultralytics-compatible detection checkpoint.
-- `osnet.pth` must be a torchreid/deep-person-reid-compatible OSNet-x1.0 checkpoint.
+- `osnet_ain_x1_0.pth` must be a torchreid/deep-person-reid-compatible
+  OSNet-AIN-x1.0 checkpoint. A regular OSNet-x1.0 checkpoint is not interchangeable.
 - Videos must be readable by the codecs available to your OpenCV build.
 
 You may use different names or locations by changing `detector.model_path`,
@@ -299,5 +304,6 @@ offline baseline.
 - If GPU inference fails, set both device values to `cpu` to verify the pipeline.
 - If there are no Re-ID embeddings, reduce crop size limits and confirm that ByteTrack
   is producing IDs. The CSV `num_embeddings` column makes this visible.
-- If OSNet reports no compatible parameters, use an OSNet-x1.0 checkpoint rather than
-  weights from another OSNet width or an unrelated Re-ID architecture.
+- If OSNet reports incompatible parameters, ensure the checkpoint architecture exactly
+  matches `reid.architecture`. The supported values are `osnet_ain_x1_0` and
+  `osnet_x1_0`; checkpoints from different widths are not interchangeable.
