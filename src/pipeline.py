@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import dataclass
-from itertools import combinations
+from itertools import combinations, islice
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Iterator, TypeVar
 
 import cv2
 import numpy as np
@@ -30,8 +33,42 @@ from .track_database import (
 )
 from .track_segmenter import SegmentationResult, TrackSegmenter
 from .utils.common import ProjectError, project_path
-from .utils.video import VideoReader, create_video_writer
+from .utils.video import VideoReader, create_video_writer, prefetch
 from .visualizer import Visualizer
+
+T = TypeVar("T")
+
+
+def batched(items: Iterable[T], size: int) -> Iterator[list[T]]:
+    iterator = iter(items)
+    while batch := list(islice(iterator, size)):
+        yield batch
+
+
+def crop_quality(observations: list[TrackObservation], width: int, height: int,
+                 max_occlusion: float, border_margin: int) -> list[tuple[float, bool]]:
+    """Return ``(occlusion, reliable)`` for each box in one frame.
+
+    Occlusion is the fraction of a box covered by another box whose bottom edge is
+    lower in the image; with a ground-level camera that person stands in front.
+    Occluded or border-cut crops mix in background/other people and corrupt Re-ID.
+    """
+    qualities: list[tuple[float, bool]] = []
+    for observation in observations:
+        x1, y1, x2, y2 = observation.bbox
+        area = max(1, (x2 - x1) * (y2 - y1))
+        occlusion = 0.0
+        for other in observations:
+            if other is observation or other.bbox[3] < y2:
+                continue
+            overlap_w = min(x2, other.bbox[2]) - max(x1, other.bbox[0])
+            overlap_h = min(y2, other.bbox[3]) - max(y1, other.bbox[1])
+            if overlap_w > 0 and overlap_h > 0:
+                occlusion = max(occlusion, overlap_w * overlap_h / area)
+        truncated = (x1 <= border_margin or y1 <= border_margin or
+                     x2 >= width - border_margin or y2 >= height - border_margin)
+        qualities.append((occlusion, occlusion <= max_occlusion and not truncated))
+    return qualities
 
 
 @dataclass(frozen=True)
@@ -42,6 +79,7 @@ class PipelineSummary:
     global_persons: int
     cross_camera_matches: int
     output_directory: Path
+    stage_seconds: dict[str, float]
 
 
 class MultiCameraTrackingPipeline:
@@ -58,6 +96,7 @@ class MultiCameraTrackingPipeline:
         self.observations: dict[str, dict[int, list[TrackObservation]]] = {}
         self.camera_configs = self._camera_configs()
         self.frame_diagnostics: list[dict[str, Any]] = []
+        self.stage_seconds: dict[str, float] = {}
 
     def _camera_configs(self) -> list[dict[str, Any]]:
         cameras: list[dict[str, Any]] = []
@@ -115,47 +154,74 @@ class MultiCameraTrackingPipeline:
     def _process_camera(self, camera: dict[str, Any]) -> None:
         camera_id = camera["id"]
         offset = camera["time_offset_seconds"]
-        sample_interval = int(self.config["reid"]["sample_interval"])
-        min_width = int(self.config["reid"]["min_crop_width"])
-        min_height = int(self.config["reid"]["min_crop_height"])
+        reid_cfg = self.config["reid"]
+        sample_interval = int(reid_cfg["sample_interval"])
+        min_width = int(reid_cfg["min_crop_width"])
+        min_height = int(reid_cfg["min_crop_height"])
+        max_occlusion = float(reid_cfg.get("max_occlusion", 0.30))
+        border_margin = int(reid_cfg.get("border_margin", 2))
+        save_crops = bool(self.config["output"].get("save_crops", False))
         if sample_interval <= 0:
             raise ProjectError("reid.sample_interval must be greater than zero.")
         if min_width <= 0 or min_height <= 0:
             raise ProjectError("Minimum crop dimensions must be greater than zero.")
 
         self.detector_tracker.reset()
+        batch_size = self.detector_tracker.batch_size
         frame_records: dict[int, list[TrackObservation]] = {}
         with VideoReader(camera["resolved_path"]) as reader:
-            for frame_index, frame in reader:
-                timestamp = frame_index / reader.metadata.fps + offset
-                observations = self.detector_tracker.track_frame(
-                    frame, camera_id, frame_index, timestamp
-                )
-                if observations:
-                    frame_records[frame_index] = observations
-                    self._record_remaining_overlaps(observations)
-                for observation in observations:
-                    self.database.update(observation)
-                    if frame_index % sample_interval != 0:
-                        continue
-                    x1, y1, x2, y2 = observation.bbox
-                    if x2 - x1 < min_width or y2 - y1 < min_height:
-                        continue
-                    crop = frame[y1:y2, x1:x2]
-                    if crop.size == 0:
-                        continue
-                    embedding = self.reid.extract_embedding(crop)
-                    self.database.add_embedding(
-                        (camera_id, observation.local_track_id), observation, embedding
+            fps = reader.metadata.fps
+            total = reader.metadata.frame_count
+            next_log = 250
+            with closing(prefetch(reader, 4 * batch_size)) as frames:
+                for batch in batched(frames, batch_size):
+                    indices = [frame_index for frame_index, _ in batch]
+                    images = [frame for _, frame in batch]
+                    per_frame = self.detector_tracker.track_batch(
+                        images, camera_id, indices, [i / fps + offset for i in indices]
                     )
-                    if bool(self.config["output"].get("save_crops", False)):
-                        self._save_crop(
-                            camera_id, observation.local_track_id, frame_index, crop
+                    # Crops of the whole batch go through OSNet in one forward pass.
+                    pending: list[tuple[TrackObservation, np.ndarray, float, bool]] = []
+                    for frame_index, frame, observations in zip(indices, images, per_frame):
+                        if not observations:
+                            continue
+                        frame_records[frame_index] = observations
+                        self._record_remaining_overlaps(observations)
+                        for observation in observations:
+                            self.database.update(observation)
+                        if frame_index % sample_interval != 0:
+                            continue
+                        height, width = frame.shape[:2]
+                        qualities = crop_quality(
+                            observations, width, height, max_occlusion, border_margin
                         )
-                if frame_index > 0 and frame_index % 250 == 0:
-                    total = reader.metadata.frame_count
-                    suffix = f"/{total}" if total > 0 else ""
-                    logging.info("%s: processed %d%s frames", camera_id, frame_index, suffix)
+                        for observation, (occlusion, reliable) in zip(observations, qualities):
+                            x1, y1, x2, y2 = observation.bbox
+                            if x2 - x1 < min_width or y2 - y1 < min_height:
+                                continue
+                            crop = frame[y1:y2, x1:x2]
+                            if crop.size == 0:
+                                continue
+                            pending.append((observation, crop, occlusion, reliable))
+                            if save_crops:
+                                self._save_crop(
+                                    camera_id, observation.local_track_id, frame_index, crop
+                                )
+                    if pending:
+                        embeddings = self.reid.extract_embeddings(
+                            [crop for _, crop, _, _ in pending]
+                        )
+                        for (observation, _, occlusion, reliable), embedding in zip(
+                            pending, embeddings
+                        ):
+                            self.database.add_embedding(
+                                (camera_id, observation.local_track_id), observation,
+                                embedding, occlusion, reliable,
+                            )
+                    if indices[-1] >= next_log:
+                        suffix = f"/{total}" if total > 0 else ""
+                        logging.info("%s: processed %d%s frames", camera_id, indices[-1], suffix)
+                        next_log += 250
         self.observations[camera_id] = frame_records
 
     def _save_local_tracks(self, tracks: list[LocalTrack]) -> None:
@@ -385,7 +451,8 @@ class MultiCameraTrackingPipeline:
             bool(output_cfg.get("show_camera_id", True)),
         )
         codec = str(output_cfg.get("codec", "mp4v"))
-        with VideoReader(camera["resolved_path"]) as reader:
+        with VideoReader(camera["resolved_path"]) as reader, \
+                closing(prefetch(reader, 16)) as frames:
             global_writer = create_video_writer(
                 self.output_dir / "videos" / f"{camera_id}_global_tracking.mp4",
                 reader.metadata, codec
@@ -395,7 +462,7 @@ class MultiCameraTrackingPipeline:
                 reader.metadata, codec
             ) if save_local else None
             try:
-                for frame_index, frame in reader:
+                for frame_index, frame in frames:
                     raw = self.observations[camera_id].get(frame_index, [])
                     observations = self._deduplicate_frame(raw, camera_ids)
                     if global_writer is not None:
@@ -414,9 +481,12 @@ class MultiCameraTrackingPipeline:
 
     def run(self) -> PipelineSummary:
         total_steps = len(self.camera_configs) + 5
+        clock = time.perf_counter()
         for index, camera in enumerate(self.camera_configs, start=2):
             print(f"[{index}/{total_steps}] Processing camera {camera['id']}")
             self._process_camera(camera)
+        self.stage_seconds["detect_track_reid"] = time.perf_counter() - clock
+        clock = time.perf_counter()
         self.database.finalize()
         tracks = self.database.values()
         self._save_local_tracks(tracks)
@@ -476,9 +546,20 @@ class MultiCameraTrackingPipeline:
             segmentation, stitching, assignment
         )
 
+        self.stage_seconds["repair_and_matching"] = time.perf_counter() - clock
+
         print(f"[{total_steps}/{total_steps}] Rendering output videos")
-        for camera in self.camera_configs:
-            self._render_camera(camera, global_ids, camera_ids)
+        clock = time.perf_counter()
+        # Rendering is decode/draw/encode on the CPU; OpenCV releases the GIL, so threads scale.
+        workers = max(1, int(self.config["output"].get("render_workers", 3)))
+        with ThreadPoolExecutor(max_workers=min(workers, len(self.camera_configs))) as pool:
+            futures = [
+                pool.submit(self._render_camera, camera, global_ids, camera_ids)
+                for camera in self.camera_configs
+            ]
+            for future in futures:
+                future.result()
+        self.stage_seconds["render"] = time.perf_counter() - clock
 
         counts = {
             camera["id"]: len(self.database.for_camera(camera["id"]))
@@ -493,5 +574,5 @@ class MultiCameraTrackingPipeline:
         return PipelineSummary(
             counts, camera_counts, len(stitching.accepted_matches),
             len(assignment.global_tracks), len(assignment.accepted_matches),
-            self.output_dir,
+            self.output_dir, dict(self.stage_seconds),
         )

@@ -52,6 +52,8 @@ def main() -> int:
     print(f"Same-camera stitched links: {summary.intra_camera_matches}")
     print(f"Global persons: {summary.global_persons}")
     print(f"Cross-camera matches: {summary.cross_camera_matches}\n")
+    timings = ", ".join(f"{name} {seconds:.1f}s" for name, seconds in summary.stage_seconds.items())
+    print(f"Stage timings: {timings}\n")
     print("Results:")
     print(summary.output_directory / "videos")
     print(summary.output_directory / "local_tracks.csv")

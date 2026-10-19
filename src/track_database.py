@@ -24,6 +24,17 @@ class EmbeddingSample:
     bbox: tuple[int, int, int, int]
     confidence: float
     vector: np.ndarray = field(repr=False)
+    # Fraction of this box covered by a person standing in front of it.
+    occlusion: float = 0.0
+    # False when the crop is occluded or cut by the image border.
+    reliable: bool = True
+
+
+def preferred_samples(samples: list[EmbeddingSample],
+                      minimum: int = 2) -> list[EmbeddingSample]:
+    """Use only clean crops when enough exist; otherwise fall back to every crop."""
+    reliable = [sample for sample in samples if sample.reliable]
+    return reliable if len(reliable) >= minimum else list(samples)
 
 
 def robust_descriptor(
@@ -32,6 +43,7 @@ def robust_descriptor(
     """Return an L2 descriptor, median quality, and number of retained samples."""
     if not samples:
         return None, float("nan"), 0
+    samples = preferred_samples(samples)
     vectors = np.stack([l2_normalize(sample.vector) for sample in samples])
     similarities = np.clip(vectors @ vectors.T, -1.0, 1.0)
     medoid_index = int(np.argmax(np.mean(similarities, axis=1)))
@@ -73,7 +85,7 @@ class LocalTrack:
     def finalize(self) -> None:
         """Mean-pool raw descriptors for backward-compatible local-track diagnostics."""
         vectors = (
-            [sample.vector for sample in self.embedding_samples]
+            [sample.vector for sample in preferred_samples(self.embedding_samples)]
             if self.embedding_samples else self.embeddings
         )
         if vectors:
@@ -140,7 +152,8 @@ class TrackDatabase:
         track.num_frames = len(track.observations)
 
     def add_embedding(self, key: TrackKey, observation: TrackObservation,
-                      embedding: np.ndarray) -> None:
+                      embedding: np.ndarray, occlusion: float = 0.0,
+                      reliable: bool = True) -> None:
         if key not in self.tracks:
             raise KeyError(f"Unknown local track: {key}")
         self.tracks[key].embedding_samples.append(
@@ -150,6 +163,8 @@ class TrackDatabase:
                 bbox=observation.bbox,
                 confidence=observation.confidence,
                 vector=l2_normalize(embedding),
+                occlusion=float(occlusion),
+                reliable=bool(reliable),
             )
         )
 

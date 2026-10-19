@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import queue
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator, TypeVar
 
 import cv2
 import numpy as np
 
 from .common import ProjectError
+
+T = TypeVar("T")
+_END = object()
 
 
 @dataclass(frozen=True)
@@ -72,3 +77,44 @@ def create_video_writer(path: Path, metadata: VideoMetadata, codec: str = "mp4v"
     if not writer.isOpened():
         raise ProjectError(f"OpenCV could not create output video:\n{path}")
     return writer
+
+
+def prefetch(items: Iterable[T], buffer_size: int = 32) -> Iterator[T]:
+    """Produce items on a background thread so decoding overlaps GPU work.
+
+    OpenCV releases the GIL while decoding, so the thread runs truly in parallel.
+    Exceptions raised by the producer are re-raised in the consumer.
+    """
+    buffer: queue.Queue = queue.Queue(maxsize=max(1, buffer_size))
+    stop = threading.Event()
+
+    def produce() -> None:
+        try:
+            for item in items:
+                if stop.is_set():
+                    return
+                buffer.put(item)
+        except BaseException as exc:  # Forwarded to the consumer below.
+            buffer.put(exc)
+        finally:
+            buffer.put(_END)
+
+    worker = threading.Thread(target=produce, daemon=True)
+    worker.start()
+    try:
+        while True:
+            item = buffer.get()
+            if item is _END:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        stop.set()
+        # Drain so a blocked producer can observe the stop flag and exit.
+        while worker.is_alive():
+            try:
+                buffer.get(timeout=0.1)
+            except queue.Empty:
+                pass
+        worker.join()

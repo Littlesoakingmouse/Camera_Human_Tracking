@@ -6,6 +6,11 @@ detector:
   iou_threshold: 0.60
   person_class_id: 0
   device: auto
+  image_size: 640
+  # Frames per YOLO forward pass; per-frame calls are dominated by Python overhead.
+  batch_size: 8
+  # FP16 inference on CUDA (ignored on CPU).
+  half: true
 
 tracker:
   config_path: configs/bytetrack.yaml
@@ -19,6 +24,14 @@ reid:
   sample_interval: 5
   min_crop_width: 30
   min_crop_height: 60
+  batch_size: 64
+  half: true
+  # Average each embedding with its mirrored crop.
+  flip_augmentation: true
+  # Crops covered more than this by a person in front, or cut by the frame border,
+  # are kept but only used when a track has too few clean crops.
+  max_occlusion: 0.30
+  border_margin: 2
 
 tracklet_split:
   enabled: true
@@ -45,38 +58,40 @@ intra_camera:
   duplicate_min_shared_frames: 2
 
 matching:
-  similarity_threshold: 0.6654
+  similarity_threshold: 0.7
   max_time_gap_seconds: 30
   use_time_constraint: true
 
 video:
   camera_1:
     id: cam1
-    path: data/raw/video3_1.avi
+    path: data/raw/1.avi
     time_offset_seconds: 0
   camera_2:
     id: cam2
-    path: data/raw/video3_2.avi
+    path: data/raw/2.avi
     time_offset_seconds: 0
   camera_3:
     id: cam3
-    path: data/raw/video3_3.avi
+    path: data/raw/3.avi
     time_offset_seconds: 0
   camera_4:
     id: cam4
-    path: data/raw/video3_4.avi
+    path: data/raw/4.avi
     time_offset_seconds: 0
   camera_5:
     id: cam5
-    path: data/raw/video3_5.avi
+    path: data/raw/5.avi
     time_offset_seconds: 0
 
 output:
-  save_crops: true
+  save_crops: false
   save_local_tracking_video: false
   save_global_tracking_video: true
   show_camera_id: true
   show_local_id: true
-  show_confidence: false
+  show_confidence: true
   codec: mp4v
+  # Cameras rendered in parallel during the replay pass.
+  render_workers: 3
   output_directory: outputs

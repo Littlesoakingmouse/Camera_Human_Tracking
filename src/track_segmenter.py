@@ -7,10 +7,12 @@ from dataclasses import dataclass
 import numpy as np
 
 from .track_database import (
+    EmbeddingSample,
     LocalTrack,
     ObservationKey,
     SegmentKey,
     TrackSegment,
+    preferred_samples,
 )
 from .utils.common import l2_normalize
 
@@ -68,8 +70,14 @@ class TrackSegmenter:
     def _window_descriptor(vectors: list[np.ndarray]) -> np.ndarray:
         return l2_normalize(np.mean(np.stack(vectors), axis=0))
 
-    def _candidate_boundaries(self, track: LocalTrack) -> list[tuple[int, float]]:
+    def _detection_samples(self, track: LocalTrack) -> list[EmbeddingSample]:
+        """Ordered samples for change-point search; occluded crops mimic an ID switch."""
         samples = sorted(track.embedding_samples, key=lambda sample: sample.frame_index)
+        minimum = max(self.window_size, self.min_segment_embeddings)
+        return preferred_samples(samples, 2 * minimum)
+
+    def _candidate_boundaries(self, track: LocalTrack,
+                              samples: list[EmbeddingSample]) -> list[tuple[int, float]]:
         minimum = max(self.window_size, self.min_segment_embeddings)
         if not self.enabled or len(samples) < 2 * minimum:
             return []
@@ -116,25 +124,26 @@ class TrackSegmenter:
 
     def _segments_for_track(self, track: LocalTrack) -> tuple[list[TrackSegment], list[SplitEvent]]:
         samples = sorted(track.embedding_samples, key=lambda sample: sample.frame_index)
-        boundaries = self._candidate_boundaries(track)
-        sample_edges = [0, *[index for index, _ in boundaries], len(samples)]
+        detection_samples = self._detection_samples(track)
+        boundaries = self._candidate_boundaries(track, detection_samples)
         boundary_frames = [
-            (samples[index - 1].frame_index + samples[index].frame_index) // 2
+            (detection_samples[index - 1].frame_index + detection_samples[index].frame_index) // 2
             for index, _ in boundaries
         ]
         observation_frames = sorted(track.observations)
         segments: list[TrackSegment] = []
 
-        for offset, (sample_start, sample_end) in enumerate(
-            zip(sample_edges[:-1], sample_edges[1:]), start=1
-        ):
+        for offset in range(1, len(boundaries) + 2):
             lower = boundary_frames[offset - 2] if offset > 1 else track.start_frame - 1
             upper = boundary_frames[offset - 1] if offset <= len(boundary_frames) else track.end_frame
             observations = {
                 frame: track.observations[frame]
                 for frame in observation_frames if lower < frame <= upper
             }
-            segment_samples = samples[sample_start:sample_end]
+            # Every sample, including occluded ones, belongs to the segment covering its frame.
+            segment_samples = [
+                sample for sample in samples if lower < sample.frame_index <= upper
+            ]
             if observations:
                 start_observation = observations[min(observations)]
                 end_observation = observations[max(observations)]
@@ -159,7 +168,7 @@ class TrackSegmenter:
                 split_reason="appearance_change" if boundaries else "none",
             )
             segment.finalize(self.outlier_threshold)
-            if segment.embedding is None and track.embedding is not None and len(sample_edges) == 2:
+            if segment.embedding is None and track.embedding is not None and not boundaries:
                 segment.embedding = track.embedding
                 segment.descriptor_quality = float("nan")
             segments.append(segment)

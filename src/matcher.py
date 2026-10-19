@@ -35,6 +35,21 @@ def cosine_similarity(feature_a: np.ndarray, feature_b: np.ndarray) -> float:
     return float(np.clip(np.dot(a, b) / denominator, -1.0, 1.0))
 
 
+def similarity_matrix(tracks_a: list, tracks_b: list) -> np.ndarray:
+    """Cosine similarity of every descriptor pair in one matrix product."""
+    if not tracks_a or not tracks_b:
+        return np.empty((len(tracks_a), len(tracks_b)), dtype=np.float64)
+    a = np.stack([np.asarray(track.embedding, dtype=np.float32).reshape(-1) for track in tracks_a])
+    b = np.stack([np.asarray(track.embedding, dtype=np.float32).reshape(-1) for track in tracks_b])
+    if a.shape[1] != b.shape[1]:
+        raise ValueError(f"Embedding shape mismatch: {a.shape[1]} versus {b.shape[1]}")
+    norms_a = np.linalg.norm(a, axis=1, keepdims=True)
+    norms_b = np.linalg.norm(b, axis=1, keepdims=True)
+    if np.any(norms_a <= 1e-12) or np.any(norms_b <= 1e-12):
+        raise ValueError("Cosine similarity is undefined for a zero vector.")
+    return np.clip((a / norms_a) @ (b / norms_b).T, -1.0, 1.0).astype(np.float64)
+
+
 def track_time_gap(a: LocalTrack, b: LocalTrack) -> float:
     """Return zero for overlapping intervals, otherwise the distance between them."""
     if a.end_time < b.start_time:
@@ -75,15 +90,15 @@ class CrossCameraMatcher:
         usable_b = [track for track in tracks_b if track.embedding is not None]
         if not usable_a or not usable_b:
             return []
-        cost = np.full((len(usable_a), len(usable_b)), 1e6, dtype=np.float64)
-        scores = np.full_like(cost, np.nan)
-        gaps = np.full_like(cost, np.inf)
-        for row, track_a in enumerate(usable_a):
-            for column, track_b in enumerate(usable_b):
-                eligible, score, gap = self._eligible(track_a, track_b)
-                scores[row, column], gaps[row, column] = score, gap
-                if eligible:
-                    cost[row, column] = 1.0 - score
+        scores = similarity_matrix(usable_a, usable_b)
+        gaps = np.array([
+            [track_time_gap(track_a, track_b) for track_b in usable_b]
+            for track_a in usable_a
+        ], dtype=np.float64)
+        eligible = scores >= self.threshold
+        if self.use_time_constraint:
+            eligible &= gaps <= self.max_time_gap
+        cost = np.where(eligible, 1.0 - scores, 1e6)
         rows, columns = linear_sum_assignment(cost)
         matches: list[CandidateMatch] = []
         for row, column in zip(rows, columns):
@@ -119,12 +134,12 @@ def similarity_dataframe(tracks: list[LocalTrack | TrackSegment], id_prefix: str
         for track in tracks
     ]
     matrix = np.full((len(tracks), len(tracks)), np.nan, dtype=np.float64)
-    for row, track_a in enumerate(tracks):
-        for column, track_b in enumerate(tracks):
-            if row == column:
-                continue
-            if not include_same_camera and track_a.camera_id == track_b.camera_id:
-                continue
-            if track_a.embedding is not None and track_b.embedding is not None:
-                matrix[row, column] = cosine_similarity(track_a.embedding, track_b.embedding)
+    usable = [index for index, track in enumerate(tracks) if track.embedding is not None]
+    if usable:
+        selected = [tracks[index] for index in usable]
+        matrix[np.ix_(usable, usable)] = similarity_matrix(selected, selected)
+    np.fill_diagonal(matrix, np.nan)
+    if not include_same_camera:
+        cameras = np.array([track.camera_id for track in tracks])
+        matrix[cameras[:, None] == cameras[None, :]] = np.nan
     return pd.DataFrame(matrix, index=labels, columns=labels)
