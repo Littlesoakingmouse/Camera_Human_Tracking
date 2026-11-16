@@ -7,3 +7,4 @@ numpy>=1.26,<3
 scipy>=1.12,<2
 pandas>=2.2,<3
 PyYAML>=6.0,<7
+psutil>=5.9,<8

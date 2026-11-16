@@ -17,3 +17,4 @@ outputs_*/
 .kilo/
 benchmarks/runs/
 data/benchmark/
+.versions/

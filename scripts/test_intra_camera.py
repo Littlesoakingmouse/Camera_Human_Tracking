@@ -128,5 +128,39 @@ def main() -> int:
     return 0
 
 
+
+
+def test_motion_link() -> None:
+    """A fragment lost for a few frames is re-linked by motion, even without Re-ID."""
+    from src.detector_tracker import TrackObservation
+    from src.intra_camera_matcher import IntraCameraMatcher
+    from src.track_database import TrackSegment
+
+    def segment(lid: int, frames: range, x0: float, step: float) -> TrackSegment:
+        observations = {
+            f: TrackObservation("cam1", f, f / 25.0, lid,
+                                (int(x0 + step * (f - frames[0])), 100,
+                                 int(x0 + step * (f - frames[0])) + 40, 200), 0.9)
+            for f in frames
+        }
+        return TrackSegment("cam1", lid, 1, frames[0], frames[-1], frames[0] / 25.0,
+                            frames[-1] / 25.0, observations)
+
+    walking = segment(1, range(0, 20), 0, 5)            # moves 5 px/frame
+    resumed = segment(2, range(25, 45), 125, 5)         # where it should be after 5 missed frames
+    elsewhere = segment(3, range(25, 45), 900, 5)       # someone else, far away
+    matcher = IntraCameraMatcher(0.78, 120, motion_link_enabled=True)
+    result = matcher.assign([walking, resumed, elsewhere])
+    ids = result.key_to_camera_id
+    assert ids[walking.key] == ids[resumed.key], ids
+    assert ids[elsewhere.key] != ids[walking.key], ids
+    # Without motion linking the fragments stay separate (no Re-ID samples).
+    plain = IntraCameraMatcher(0.78, 120).assign([walking, resumed]).key_to_camera_id
+    assert plain[walking.key] != plain[resumed.key]
+    print("PASS: motion link joins a short gap and ignores a distant track")
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    status = main()
+    test_motion_link()
+    raise SystemExit(status)

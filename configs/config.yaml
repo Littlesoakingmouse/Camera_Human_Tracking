@@ -13,7 +13,11 @@ detector:
   half: true
 
 tracker:
-  config_path: configs/bytetrack.yaml
+  # v3.0: BoT-SORT associates with IoU + OSNet appearance (configs/bytetrack.yaml = v2.x).
+  config_path: configs/botsort.yaml
+  # v3.0: also report the first frame of each track (Ultralytics drops it while
+  # the track is unconfirmed; large loss at low frame rates).
+  backfill_first_frame: true
 
 reid:
   model_path: models/reid/osnet_ain_x1_0.pth
@@ -22,6 +26,8 @@ reid:
   input_height: 256
   input_width: 128
   sample_interval: 5
+  # v3.0: overrides sample_interval; same Re-ID density at any frame rate.
+  samples_per_second: 5
   min_crop_width: 30
   min_crop_height: 60
   batch_size: 64
@@ -56,11 +62,34 @@ intra_camera:
   duplicate_max_overlap_frames: 45
   duplicate_max_overlap_ratio: 0.30
   duplicate_min_shared_frames: 2
+  # v3.0: re-link fragments ByteTrack lost for a few frames, using extrapolated
+  # motion (works for short fragments that have no Re-ID sample).
+  motion_link_enabled: true
+  motion_max_gap_frames: 30
+  motion_max_center_ratio: 0.75
+  motion_min_similarity: 0.50
+
+postprocess:
+  # v3.0: camera identities shorter than this are noise (false detections or
+  # fragments without Re-ID); they get GID 0 and are neither drawn nor exported.
+  min_camera_track_frames: 5
+  min_camera_track_embeddings: 0
 
 matching:
+  # v3.0: "agglomerative" = average-linkage clustering with cannot-link constraints;
+  # "hungarian" = v2.x pairwise Hungarian + greedy union.
+  method: agglomerative
+  # "set_topk": mean of the best top_fraction sample-pair cosines; "descriptor": mean vectors.
+  similarity_mode: set_topk
+  top_fraction: 0.25
   similarity_threshold: 0.7
   max_time_gap_seconds: 30
   use_time_constraint: true
+
+cache:
+  # Reuse detection/tracking/Re-ID results when only later-stage thresholds change.
+  enabled: true
+  directory: outputs/cache
 
 video:
   camera_1:

@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from .detector_tracker import DetectorTracker, TrackObservation
+from .global_association import AgglomerativeGlobalTracker
 from .global_tracker import GlobalAssignment, GlobalTracker
 from .intra_camera_matcher import (
     IntraCameraAssignment,
@@ -89,8 +90,8 @@ class MultiCameraTrackingPipeline:
         self.config = config
         self.output_dir = project_path(config, config["output"]["output_directory"])
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.detector_tracker = DetectorTracker(config)
         self.reid = ReIDModel(config)
+        self.detector_tracker = DetectorTracker(config, self.reid)
         print(f"Using device: detector={self.detector_tracker.device}, reid={self.reid.device}")
         self.database = TrackDatabase()
         self.observations: dict[str, dict[int, list[TrackObservation]]] = {}
@@ -155,7 +156,7 @@ class MultiCameraTrackingPipeline:
         camera_id = camera["id"]
         offset = camera["time_offset_seconds"]
         reid_cfg = self.config["reid"]
-        sample_interval = int(reid_cfg["sample_interval"])
+        sample_interval = int(reid_cfg.get("sample_interval", 5))
         min_width = int(reid_cfg["min_crop_width"])
         min_height = int(reid_cfg["min_crop_height"])
         max_occlusion = float(reid_cfg.get("max_occlusion", 0.30))
@@ -171,6 +172,10 @@ class MultiCameraTrackingPipeline:
         frame_records: dict[int, list[TrackObservation]] = {}
         with VideoReader(camera["resolved_path"]) as reader:
             fps = reader.metadata.fps
+            # v3.0: a rate in samples per second gives the same Re-ID density at any FPS
+            # (sample_interval=5 is 5 samples/s at 25 FPS but one per 2.5 s at 2 FPS).
+            if reid_cfg.get("samples_per_second"):
+                sample_interval = max(1, round(fps / float(reid_cfg["samples_per_second"])))
             total = reader.metadata.frame_count
             next_log = 250
             with closing(prefetch(reader, 4 * batch_size)) as frames:
@@ -199,6 +204,13 @@ class MultiCameraTrackingPipeline:
                             x1, y1, x2, y2 = observation.bbox
                             if x2 - x1 < min_width or y2 - y1 < min_height:
                                 continue
+                            if observation.embedding is not None:
+                                # BoT-SORT already ran OSNet on this detection.
+                                self.database.add_embedding(
+                                    (camera_id, observation.local_track_id), observation,
+                                    observation.embedding, occlusion, reliable,
+                                )
+                                continue
                             crop = frame[y1:y2, x1:x2]
                             if crop.size == 0:
                                 continue
@@ -207,6 +219,9 @@ class MultiCameraTrackingPipeline:
                                 self._save_crop(
                                     camera_id, observation.local_track_id, frame_index, crop
                                 )
+                    for observation in self.detector_tracker.drain_backfilled():
+                        frame_records.setdefault(observation.frame_index, []).append(observation)
+                        self.database.update(observation)
                     if pending:
                         embeddings = self.reid.extract_embeddings(
                             [crop for _, crop, _, _ in pending]
@@ -479,12 +494,155 @@ class MultiCameraTrackingPipeline:
                 if local_writer is not None:
                     local_writer.release()
 
+    def _filter_camera_tracks(self, camera_tracks: list[LocalTrack]) -> list[LocalTrack]:
+        """Keep camera identities long enough to be a real person.
+
+        Very short CIDs are mostly false detections or fragments without any
+        Re-ID sample; they cannot be matched across cameras and only add false
+        identities. Filtered CIDs get global id 0 and are not drawn or exported.
+        """
+        cfg = self.config.get("postprocess", {})
+        min_frames = int(cfg.get("min_camera_track_frames", 0))
+        min_embeddings = int(cfg.get("min_camera_track_embeddings", 0))
+        kept = [
+            track for track in camera_tracks
+            if track.num_frames >= min_frames and track.num_embeddings >= min_embeddings
+        ]
+        self.filtered_camera_tracks = len(camera_tracks) - len(kept)
+        return kept
+
+    def _associate(self, tracks: list[LocalTrack],
+                   matching_cfg: dict[str, Any]) -> GlobalAssignment:
+        method = str(matching_cfg.get("method", "hungarian"))
+        if method == "agglomerative":
+            return AgglomerativeGlobalTracker(
+                float(matching_cfg["similarity_threshold"]),
+                float(matching_cfg["max_time_gap_seconds"]),
+                bool(matching_cfg["use_time_constraint"]),
+                str(matching_cfg.get("similarity_mode", "set_topk")),
+                float(matching_cfg.get("top_fraction", 0.25)),
+            ).assign(tracks)
+        if method != "hungarian":
+            raise ProjectError(f"Unknown matching.method: {method}")
+        matcher = CrossCameraMatcher(
+            float(matching_cfg["similarity_threshold"]),
+            float(matching_cfg["max_time_gap_seconds"]),
+            bool(matching_cfg["use_time_constraint"]),
+        )
+        return GlobalTracker().assign(tracks, matcher.match_all(tracks))
+
+    @staticmethod
+    def _with_unassigned(assignment: GlobalAssignment,
+                         camera_tracks: list[LocalTrack]) -> GlobalAssignment:
+        key_to_global = dict(assignment.key_to_global_id)
+        for track in camera_tracks:
+            key_to_global.setdefault(track.key, 0)
+        return GlobalAssignment(key_to_global, assignment.global_tracks,
+                                assignment.similarity_by_track, assignment.accepted_matches)
+
+    def _save_frame_tracks(self, global_ids: dict[ObservationKey, int],
+                           camera_ids: dict[ObservationKey, int]) -> None:
+        """One row per drawn box: the exact identities shown in the replay videos."""
+        rows = []
+        for camera_id, frames in self.observations.items():
+            for frame_index, raw in frames.items():
+                for obs in self._deduplicate_frame(raw, camera_ids):
+                    key = camera_id, obs.local_track_id, frame_index
+                    global_id = global_ids.get(key, 0)
+                    if global_id == 0:
+                        continue
+                    x1, y1, x2, y2 = obs.bbox
+                    rows.append((camera_id, frame_index, global_id, camera_ids.get(key, 0),
+                                 obs.local_track_id, x1, y1, x2 - x1, y2 - y1, obs.confidence))
+        pd.DataFrame(rows, columns=[
+            "camera_id", "frame_index", "global_id", "camera_person_id", "local_track_id",
+            "x", "y", "w", "h", "confidence",
+        ]).sort_values(["camera_id", "frame_index", "global_id"]).to_csv(
+            self.output_dir / "frame_tracks.csv", index=False
+        )
+
+    def _save_run_info(self) -> None:
+        """Config snapshot, code version and timings, so every output is reproducible."""
+        import json
+        import subprocess
+
+        try:
+            version = subprocess.run(
+                ["git", "describe", "--tags", "--always", "--dirty"],
+                cwd=self.config["_project_root"], capture_output=True, text=True, check=True,
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            version = "unknown"
+        config = {k: v for k, v in self.config.items() if not k.startswith("_")}
+        info = {"code_version": version, "stage_seconds": self.stage_seconds,
+                "filtered_camera_tracks": getattr(self, "filtered_camera_tracks", 0),
+                "config": config}
+        (self.output_dir / "run_info.json").write_text(
+            json.dumps(info, indent=2, default=str), encoding="utf-8"
+        )
+
+    def _inference_cache_path(self) -> Path | None:
+        """Cache file for the model stage, keyed by everything that changes its output.
+
+        Detection, tracking and Re-ID dominate run time but do not depend on the
+        split/stitch/matching thresholds. With ``cache.enabled`` those thresholds can
+        be re-tuned in seconds instead of re-running both models.
+        """
+        cfg = self.config.get("cache", {})
+        if not cfg.get("enabled", False):
+            return None
+        import hashlib
+        import json
+
+        videos = [
+            (camera["id"], str(camera["resolved_path"]), camera["time_offset_seconds"],
+             camera["resolved_path"].stat().st_size if camera["resolved_path"].exists() else 0)
+            for camera in self.camera_configs
+        ]
+        tracker_file = project_path(self.config, self.config["tracker"]["config_path"])
+        key = json.dumps({
+            "detector": self.config["detector"], "reid": self.config["reid"],
+            "tracker": tracker_file.read_text(encoding="utf-8"),
+            "tracker_options": {k: v for k, v in self.config["tracker"].items()
+                                if k != "config_path"},
+            "videos": videos,
+            "format": 1,
+        }, sort_keys=True, default=str)
+        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+        directory = project_path(self.config, cfg.get("directory", "outputs/cache"))
+        return directory / f"inference_{digest}.pkl"
+
+    def _load_inference_cache(self) -> bool:
+        path = self._inference_cache_path()
+        if path is None or not path.is_file():
+            return False
+        import pickle
+
+        with path.open("rb") as stream:
+            state = pickle.load(stream)
+        self.database, self.observations, self.frame_diagnostics = state
+        print(f"[cache] Loaded detection/tracking/Re-ID results from {path.name}")
+        return True
+
+    def _save_inference_cache(self) -> None:
+        path = self._inference_cache_path()
+        if path is None:
+            return
+        import pickle
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("wb") as stream:
+            pickle.dump((self.database, self.observations, self.frame_diagnostics), stream,
+                        protocol=pickle.HIGHEST_PROTOCOL)
+
     def run(self) -> PipelineSummary:
         total_steps = len(self.camera_configs) + 5
         clock = time.perf_counter()
-        for index, camera in enumerate(self.camera_configs, start=2):
-            print(f"[{index}/{total_steps}] Processing camera {camera['id']}")
-            self._process_camera(camera)
+        if not self._load_inference_cache():
+            for index, camera in enumerate(self.camera_configs, start=2):
+                print(f"[{index}/{total_steps}] Processing camera {camera['id']}")
+                self._process_camera(camera)
+            self._save_inference_cache()
         self.stage_seconds["detect_track_reid"] = time.perf_counter() - clock
         clock = time.perf_counter()
         self.database.finalize()
@@ -519,6 +677,10 @@ class MultiCameraTrackingPipeline:
             int(intra_cfg.get("duplicate_max_overlap_frames", 45)),
             float(intra_cfg.get("duplicate_max_overlap_ratio", 0.30)),
             int(intra_cfg.get("duplicate_min_shared_frames", 2)),
+            bool(intra_cfg.get("motion_link_enabled", False)),
+            int(intra_cfg.get("motion_max_gap_frames", 30)),
+            float(intra_cfg.get("motion_max_center_ratio", 0.75)),
+            float(intra_cfg.get("motion_min_similarity", 0.50)),
         ).assign(segmentation.segments)
         self._save_track_segments(segmentation, stitching)
         self._save_camera_tracks(stitching)
@@ -528,24 +690,21 @@ class MultiCameraTrackingPipeline:
         matching_step = len(self.camera_configs) + 4
         print(f"[{matching_step}/{total_steps}] Performing cross-camera matching")
         matching_cfg = self.config["matching"]
-        matcher = CrossCameraMatcher(
-            float(matching_cfg["similarity_threshold"]),
-            float(matching_cfg["max_time_gap_seconds"]),
-            bool(matching_cfg["use_time_constraint"]),
-        )
-        matches = matcher.match_all(stitching.camera_tracks)
         similarity_dataframe(
             segmentation.segments, include_same_camera=True
         ).to_csv(self.output_dir / "local_similarity_matrix.csv")
         similarity_dataframe(stitching.camera_tracks, id_prefix="C").to_csv(
             self.output_dir / "similarity_matrix.csv"
         )
-        assignment = GlobalTracker().assign(stitching.camera_tracks, matches)
+        candidates = self._filter_camera_tracks(stitching.camera_tracks)
+        assignment = self._associate(candidates, matching_cfg)
+        assignment = self._with_unassigned(assignment, stitching.camera_tracks)
         self._save_global_tracks(segmentation.segments, stitching, assignment)
         camera_ids, global_ids = self._identity_maps(
             segmentation, stitching, assignment
         )
 
+        self._save_frame_tracks(global_ids, camera_ids)
         self.stage_seconds["repair_and_matching"] = time.perf_counter() - clock
 
         print(f"[{total_steps}/{total_steps}] Rendering output videos")
@@ -560,6 +719,7 @@ class MultiCameraTrackingPipeline:
             for future in futures:
                 future.result()
         self.stage_seconds["render"] = time.perf_counter() - clock
+        self._save_run_info()
 
         counts = {
             camera["id"]: len(self.database.for_camera(camera["id"]))

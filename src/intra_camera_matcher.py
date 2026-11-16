@@ -110,6 +110,10 @@ class IntraCameraMatcher:
         duplicate_max_overlap_frames: int = 45,
         duplicate_max_overlap_ratio: float = 0.30,
         duplicate_min_shared_frames: int = 2,
+        motion_link_enabled: bool = False,
+        motion_max_gap_frames: int = 30,
+        motion_max_center_ratio: float = 0.75,
+        motion_min_similarity: float = 0.50,
     ) -> None:
         for name, value in (
             ("similarity_threshold", similarity_threshold),
@@ -138,6 +142,10 @@ class IntraCameraMatcher:
         self.duplicate_max_overlap_frames = int(duplicate_max_overlap_frames)
         self.duplicate_max_overlap_ratio = float(duplicate_max_overlap_ratio)
         self.duplicate_min_shared_frames = int(duplicate_min_shared_frames)
+        self.motion_link_enabled = bool(motion_link_enabled)
+        self.motion_max_gap_frames = int(motion_max_gap_frames)
+        self.motion_max_center_ratio = float(motion_max_center_ratio)
+        self.motion_min_similarity = float(motion_min_similarity)
 
     def _usable(self, track: TrackSegment) -> bool:
         return track.embedding is not None and track.num_embeddings >= self.min_embeddings
@@ -184,12 +192,52 @@ class IntraCameraMatcher:
                 return reason
         return None
 
+    def _motion_distance(self, previous: TrackSegment, current: TrackSegment) -> float | None:
+        """Distance between ``current``'s first box and ``previous`` extrapolated forward.
+
+        Returns the center distance divided by the box diagonal, or ``None`` when the
+        pair is not a short temporal gap. A constant velocity is estimated from the
+        last observations of ``previous``; this links fragments ByteTrack lost for a
+        few frames (missed detections, brief occlusion) even without Re-ID samples.
+        """
+        if not previous.observations or not current.observations:
+            return None
+        # Segments of one LID were split on purpose (ID switch); never re-join them.
+        if previous.local_track_id == current.local_track_id:
+            return None
+        last_frame = max(previous.observations)
+        first_frame = min(current.observations)
+        gap = first_frame - last_frame
+        if gap < 1 or gap > self.motion_max_gap_frames:
+            return None
+        tail = sorted(previous.observations)[-6:]
+        centers = np.array([
+            [(previous.observations[f].bbox[0] + previous.observations[f].bbox[2]) / 2.0,
+             (previous.observations[f].bbox[1] + previous.observations[f].bbox[3]) / 2.0]
+            for f in tail
+        ])
+        velocity = np.zeros(2)
+        if len(tail) >= 2 and tail[-1] > tail[0]:
+            velocity = (centers[-1] - centers[0]) / float(tail[-1] - tail[0])
+        predicted = centers[-1] + velocity * gap
+        last_box = previous.observations[last_frame].bbox
+        first_box = current.observations[first_frame].bbox
+        height_a, height_b = last_box[3] - last_box[1], first_box[3] - first_box[1]
+        if min(height_a, height_b) <= 0 or max(height_a, height_b) / min(height_a, height_b) > 1.5:
+            return None
+        actual = np.array([(first_box[0] + first_box[2]) / 2.0, (first_box[1] + first_box[3]) / 2.0])
+        diagonal = max(1.0, float(np.hypot(first_box[2] - first_box[0], height_b)))
+        return float(np.linalg.norm(actual - predicted) / diagonal)
+
     def _match_camera(
         self, tracks: list[TrackSegment]
     ) -> tuple[list[IntraCameraMatch], list[IntraCameraDecision]]:
         if not self.enabled:
             return [], []
-        usable = [track for track in tracks if self._usable(track)]
+        # Motion links also consider fragments too short to carry Re-ID samples.
+        usable = tracks if self.motion_link_enabled else [
+            track for track in tracks if self._usable(track)
+        ]
         if len(usable) < 2:
             return [], []
 
@@ -212,10 +260,23 @@ class IntraCameraMatcher:
                 )
                 if previous_order >= current_order:
                     continue
-                similarity = cosine_similarity(previous.embedding, current.embedding)
+                appearance_ok = self._usable(previous) and self._usable(current)
+                similarity = (cosine_similarity(previous.embedding, current.embedding)
+                              if appearance_ok else float("nan"))
                 metrics = self._overlap_metrics(previous, current)
+                motion = (self._motion_distance(previous, current)
+                          if self.motion_link_enabled and not metrics.frames else None)
 
-                if metrics.frames:
+                if (motion is not None and motion <= self.motion_max_center_ratio
+                        and (not appearance_ok or similarity >= self.motion_min_similarity)):
+                    gap = current.start_time - previous.end_time
+                    # Above any appearance-only score: adjacency in space and time is
+                    # stronger evidence than appearance for a few-frame gap.
+                    score = 1.0 + 0.1 * (1.0 - motion / max(self.motion_max_center_ratio, 1e-6))
+                    match_type = "motion_link"
+                elif not appearance_ok:
+                    continue
+                elif metrics.frames:
                     reason = self._duplicate_reason(similarity, metrics)
                     if reason is not None:
                         decisions.append(IntraCameraDecision(

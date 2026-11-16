@@ -11,6 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.detector_tracker import DetectorTracker  # noqa: E402
+from src.reid import ReIDModel  # noqa: E402
 from src.utils.common import ProjectError, load_config, project_path  # noqa: E402
 from src.utils.video import VideoReader  # noqa: E402
 
@@ -27,7 +28,8 @@ def main() -> int:
                        if str(item["id"]) == args.camera), None)
         if camera is None:
             raise ProjectError(f"Camera not found in configuration: {args.camera}")
-        tracker = DetectorTracker(config)
+        # BoT-SORT with Re-ID needs the OSNet model; ByteTrack ignores it.
+        tracker = DetectorTracker(config, ReIDModel(config))
         tracker.reset()
         counts: collections.Counter[int] = collections.Counter()
         offset = float(camera.get("time_offset_seconds", 0.0))

@@ -1,0 +1,17 @@
+# Ultralytics BoT-SORT settings (v3.0). Association uses IoU and, for nearby
+# boxes, OSNet appearance computed by this project's Re-ID model.
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.10
+new_track_thresh: 0.25
+track_buffer: 45
+match_thresh: 0.80
+fuse_score: true
+# Static cameras: no global motion compensation needed.
+gmc_method: none
+# Appearance is only trusted for track/detection pairs with IoU >= proximity_thresh.
+proximity_thresh: 0.10
+# Cosine similarity needed for an appearance match: 1 - 2 * (1 - appearance_thresh).
+appearance_thresh: 0.75
+with_reid: true
+model: osnet

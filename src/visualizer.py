@@ -35,6 +35,8 @@ class Visualizer:
                 observation.frame_index,
             )
             global_id = global_ids.get(key) if global_ids is not None else None
+            if global_id == 0:  # filtered out as noise by postprocess
+                continue
             camera_id = camera_ids.get(key) if camera_ids is not None else None
             identity = global_id if global_id is not None else (
                 camera_id if camera_id is not None else observation.local_track_id
