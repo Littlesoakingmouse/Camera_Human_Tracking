@@ -253,9 +253,12 @@ def main() -> int:
         "counts": {"global_ids": int(pred["id"].nunique()), "boxes": int(len(pred))},
     }
     (run_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-    results_dir = PROJECT_ROOT / "benchmarks" / "results"
-    results_dir.mkdir(exist_ok=True)
-    (results_dir / f"{args.name}.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    # Only official runs (released config, fresh inference) go into the version report.
+    if not overrides and not args.use_cache:
+        results_dir = PROJECT_ROOT / "benchmarks" / "results"
+        results_dir.mkdir(exist_ok=True)
+        (results_dir / f"{args.name}.json").write_text(json.dumps(result, indent=2),
+                                                       encoding="utf-8")
 
     m, s, p = metrics["mtmc"], metrics["per_camera_mean"], performance
     print(f"\n{args.name}: MTMC IDF1 {m['IDF1']:.3f} HOTA {m['HOTA']:.3f} | per-cam HOTA "

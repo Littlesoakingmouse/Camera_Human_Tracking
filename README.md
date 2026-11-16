@@ -1,8 +1,10 @@
 # Multi Camera Person Tracking
 
-Tài liệu kỹ thuật cho hệ thống theo dõi người đa camera chạy offline. Dự án nhận video từ nhiều camera, phát hiện người bằng YOLO, theo dõi cục bộ bằng ByteTrack, so khớp ngoại hình bằng OSNet AIN, sửa các lỗi ID phổ biến, rồi gán một Global ID (GID) cho cùng một người giữa các camera.
+Tài liệu kỹ thuật cho hệ thống theo dõi người đa camera chạy offline. Dự án nhận video từ nhiều camera, phát hiện người bằng YOLO, theo dõi cục bộ bằng BoT-SORT kết hợp ngoại hình OSNet AIN, sửa các lỗi ID phổ biến, rồi gán một Global ID (GID) cho cùng một người giữa các camera.
 
 Mục tiêu chính không phải là huấn luyện model hay realtime streaming. Đây là pipeline có thể kiểm tra được bằng video và CSV: mỗi quyết định split, merge hoặc từ chối merge đều có dữ liệu để truy vết.
+
+**Phiên bản hiện tại: v3.0.** Độ chính xác và hiệu năng của từng phiên bản được đo trên benchmark HDA có ground truth: xem [docs/EVALUATION.md](docs/EVALUATION.md) (phương pháp), [docs/BENCHMARK_RESULTS.md](docs/BENCHMARK_RESULTS.md) (số liệu), [docs/ABLATION.md](docs/ABLATION.md) (đóng góp từng thay đổi) và [docs/CHANGELOG.md](docs/CHANGELOG.md) (lịch sử).
 
 ## Mục lục
 
@@ -18,6 +20,7 @@ Mục tiêu chính không phải là huấn luyện model hay realtime streaming
 10. [Output và cách kiểm tra](#output-và-cách-kiểm-tra)
 11. [Cấu hình và cách chạy](#cấu-hình-và-cách-chạy)
 12. [Kiểm thử hiệu chỉnh và giới hạn](#kiểm-thử-hiệu-chỉnh-và-giới-hạn)
+13. [Đánh giá và phiên bản](#đánh-giá-và-phiên-bản)
 
 ## Kiến trúc và luồng xử lý
 
@@ -28,22 +31,25 @@ Video từng camera
 YOLO person detection + NMS
     |
     v
-ByteTrack theo dõi trong từng camera -> LID thô
+OSNet AIN cho mọi detection (một forward mỗi batch frame)
     |
     v
-Crop người theo mẫu -> OSNet AIN -> embedding
+BoT-SORT: IoU + appearance trong từng camera -> LID thô (+ ghi bù frame đầu)
+    |
+    v
+Embedding của track được lấy mẫu theo giây -> EmbeddingSample
     |
     v
 Tách LID có appearance thay đổi -> TrackSegment
     |
     v
-Gộp re-entry / duplicate overlap trong cùng camera -> CID
+Gộp re-entry / duplicate overlap / motion link trong cùng camera -> CID
     |
     v
-Cosine similarity + ràng buộc thời gian giữa camera -> candidate match
+Lọc CID quá ngắn (nhiễu) -> GID 0
     |
     v
-Hungarian + conflict-safe union -> GID
+Phân cụm agglomerative có ràng buộc, so khớp tập-với-tập -> GID
     |
     v
 Replay video, vẽ GID | CID | LID và xuất CSV diagnostics
@@ -51,7 +57,7 @@ Replay video, vẽ GID | CID | LID và xuất CSV diagnostics
 
 Pipeline chia thành ba pha lớn:
 
-1. **Inference cục bộ:** đọc từng video độc lập, chạy YOLO theo batch, cập nhật ByteTrack theo thứ tự frame và lưu mọi bbox/embedding.
+1. **Inference cục bộ:** đọc từng video độc lập, chạy YOLO và OSNet theo batch, cập nhật BoT-SORT theo thứ tự frame và lưu mọi bbox/embedding. Kết quả pha này được cache (`cache.enabled`), nên chỉnh ngưỡng ở pha 2 không cần chạy lại model.
 2. **Repair và matching offline:** tách LID bị switch, stitch segment thành CID, ghép CID giữa camera thành GID.
 3. **Replay:** đọc lại video gốc, tra CID/GID theo `(camera, LID, frame)` rồi render song song nhiều camera. Pha này không chạy lại model.
 
@@ -72,13 +78,14 @@ Mỗi lần chạy in thời gian từng pha (`detect_track_reid`, `repair_and_m
 
 | Module | Trách nhiệm |
 |---|---|
-| `src/detector_tracker.py` | Bọc Ultralytics YOLO, NMS, ByteTrack và tạo `TrackObservation` |
+| `src/detector_tracker.py` | Bọc Ultralytics YOLO, NMS, BoT-SORT/ByteTrack, feature OSNet cho tracker, ghi bù frame đầu, tạo `TrackObservation` |
 | `src/reid.py` | Tải OSNet/OSNet-AIN, tiền xử lý crop và tạo embedding |
 | `src/track_database.py` | Lưu LocalTrack, bbox, EmbeddingSample, descriptor bền vững |
 | `src/track_segmenter.py` | Tìm điểm đổi appearance để tách track |
 | `src/intra_camera_matcher.py` | Gộp re-entry và duplicate track trong cùng camera |
 | `src/matcher.py` | Cosine similarity, ràng buộc thời gian, Hungarian liên camera |
-| `src/global_tracker.py` | Gán GID mà không để hai CID cùng camera vào một GID |
+| `src/global_association.py` | v3.0: phân cụm agglomerative có ràng buộc, similarity tập-với-tập |
+| `src/global_tracker.py` | v2.x: gán GID bằng union tham lam (dùng khi `matching.method: hungarian`) |
 | `src/pipeline.py` | Điều phối toàn bộ pipeline và ghi output |
 | `src/visualizer.py` | Vẽ bbox, GID, CID, LID lên video |
 
@@ -138,6 +145,34 @@ ByteTrack thường liên kết track đang tồn tại với detection confiden
 | `fuse_score` | true | Kết hợp score detection trong association |
 
 ByteTrack tốt cho chuyển động liên tục nhưng không phải định danh lâu dài. Occlusion, hai người đứng gần nhau, duplicate detection và người rời rồi quay lại đều có thể làm LID switch/duplicate. Do đó LID là dữ liệu thô, không phải identity cuối cùng.
+
+### BoT-SORT với OSNet (v3.0, mặc định)
+
+ByteTrack chỉ dùng IoU giữa box dự đoán và detection. Khi người di chuyển xa giữa hai frame (frame rate thấp, đi nhanh, camera gần), IoU về 0 và track bị đứt hoặc đổi ID. Trên benchmark HDA (khoảng 2 FPS), YOLO tìm thấy 90–98% người nhưng chỉ 31–80% còn lại sau ByteTrack.
+
+`configs/botsort.yaml` dùng BoT-SORT của Ultralytics và nạp feature OSNet của chính project:
+
+```text
+dist_iou(t, d)  = 1 - IoU(t, d)
+dist_app(t, d)  = (1 - cos(f_t, f_d)) / 2      chỉ xét khi IoU >= proximity_thresh
+                  bị loại nếu cos < 2 * appearance_thresh - 1
+cost(t, d)      = min(dist_iou, dist_app)
+```
+
+`DetectorTracker` crop mọi detection của một batch frame, chạy OSNet một lần rồi đưa feature vào `tracker.update(..., feats=...)`. Feature của detection được gán vào `TrackObservation.embedding` và dùng lại làm `EmbeddingSample`, nên OSNet chỉ chạy một lần cho mỗi detection; pipeline không crop lại.
+
+| Tham số (`botsort.yaml`) | Giá trị | Ý nghĩa |
+|---|---:|---|
+| `proximity_thresh` | 0.10 | Chỉ dùng appearance cho cặp track–detection còn chồng nhau ít nhất 10% IoU |
+| `appearance_thresh` | 0.75 | Cosine tối thiểu 0.5 để appearance được tính |
+| `match_thresh` | 0.80 | Cost tối đa để chấp nhận một cặp |
+| `gmc_method` | none | Camera tĩnh, không cần bù chuyển động camera |
+
+`tracker.config_path: configs/bytetrack.yaml` quay lại hành vi v2.x.
+
+### Ghi bù frame đầu của track
+
+Ultralytics tạo track mới ở trạng thái *chưa xác nhận* và chỉ trả về từ frame nó được khớp lần thứ hai, nên **detection đầu tiên của mỗi người luôn bị bỏ**. Với `tracker.backfill_first_frame: true`, `DetectorTracker` nhớ box chưa xác nhận và trả lại nó (qua `drain_backfilled()`) khi track được xác nhận; pipeline chèn box vào đúng frame của nó. Track không bao giờ được xác nhận vẫn bị bỏ như cũ, nên không thêm false positive.
 
 ## OSNet AIN Re Identification
 
@@ -264,6 +299,22 @@ score_reentry = similarity - 0.05 * gap / 120
 
 Time penalty chỉ ưu tiên re-entry gần hơn khi appearance tương tự, không biến một pair dưới ngưỡng thành match.
 
+### Motion link (v3.0)
+
+Khi tracker mất người vài frame rồi tạo LID mới, hai đoạn nằm sát nhau về thời gian và vị trí. Nhiều đoạn quá ngắn để có embedding nên bước re-entry bỏ qua chúng. Motion link nối các đoạn này dựa trên chuyển động:
+
+```text
+v          = (center_cuối - center_đầu) / số frame, trên tối đa 6 box cuối của đoạn trước
+predicted  = center_cuối + v * gap
+distance   = ||center_đầu_đoạn_sau - predicted|| / đường chéo box
+link nếu   1 <= gap <= motion_max_gap_frames (30)
+           và distance <= motion_max_center_ratio (0.75)
+           và chiều cao hai box chênh không quá 1.5 lần
+           và (thiếu embedding hoặc appearance >= motion_min_similarity (0.50))
+```
+
+Hai segment của **cùng một LID** không bao giờ được motion link, vì chúng bị tách có chủ đích do đổi người. Score của motion link cao hơn mọi score re-entry, nên Hungarian ưu tiên nối liền mạch hơn nối theo ngoại hình.
+
 ### Duplicate overlap
 
 Đây là trường hợp cùng một người bị tạo hai LID chạy song song, thường do duplicate detection. Khác với re-entry, overlap được phép nhưng phải thỏa đồng thời tất cả điều kiện dưới đây để không merge hai người thật đứng cạnh nhau.
@@ -308,6 +359,34 @@ Nếu không: union hai group
 
 Bất biến này ngăn một GID chứa hai CID của cùng camera, ngay cả khi pairwise matching tạo ra cạnh bắc cầu mâu thuẫn.
 
+Đây là hành vi v2.x (`matching.method: hungarian`). Điểm yếu: mỗi cặp camera được quyết định riêng, nên A~B và B~C có thể kéo A vào cùng GID với một C rất khác.
+
+### Phân cụm agglomerative có ràng buộc (v3.0, mặc định)
+
+`AgglomerativeGlobalTracker` bắt đầu với mỗi CID là một cụm, rồi lặp lại việc gộp hai cụm có **average linkage** cao nhất:
+
+```text
+linkage(X, Y) = mean_{a in X, b in Y} sim(a, b)
+gộp nếu        linkage >= similarity_threshold (0.70)
+               và không cặp (a, b) nào bị cấm:
+                   cùng camera, hoặc time_gap > max_time_gap_seconds (khi bật ràng buộc thời gian)
+```
+
+Average linkage chấm điểm theo mọi cặp thành viên, nên một cạnh bắc cầu mạnh không kéo được hai nhóm khác nhau vào nhau. Linkage được cập nhật theo công thức Lance–Williams nên mỗi bước là O(n²).
+
+`sim(a, b)` mặc định là **so khớp tập-với-tập** (`similarity_mode: set_topk`):
+
+```text
+S       = { cos(e_i, e_j) : e_i thuộc a, e_j thuộc b }   (tối đa 64 mẫu mỗi CID)
+sim     = mean của top_fraction (25%) giá trị lớn nhất của S
+```
+
+Hai camera hiếm khi thấy cùng một tư thế. So các góc nhìn gần nhau nhất của hai CID ổn định hơn so hai vector trung bình của các tư thế khác nhau. `similarity_mode: descriptor` quay lại cách v2.x.
+
+### Lọc tracklet ngắn (v3.0)
+
+CID có ít hơn `postprocess.min_camera_track_frames` (5) frame thường là false detection hoặc mảnh vỡ. Chúng nhận GID 0, không được vẽ và không được xuất. Ngưỡng tính bằng frame: ở 25 FPS là 0.2 giây, ở 2 FPS là 2.5 giây. Benchmark cho thấy 5 cân bằng tốt nhất giữa IDF1 liên camera và MOTA từng camera (xem [docs/ABLATION.md](docs/ABLATION.md)).
+
 ## Output và cách kiểm tra
 
 | File | Nội dung | Dùng để kiểm tra |
@@ -320,6 +399,8 @@ Bất biến này ngăn một GID chứa hai CID của cùng camera, ngay cả k
 | `tracking_diagnostics.csv` | Post-NMS overlap, split event, decision accept/reject | Hiệu chỉnh threshold dựa trên bằng chứng |
 | `local_similarity_matrix.csv` | Similarity segment, có cả same-camera để diagnosis | Quan sát lỗi split/stitch |
 | `similarity_matrix.csv` | Similarity CID giữa các camera | Chọn ngưỡng cross-camera |
+| `frame_tracks.csv` | v3.0: mỗi box được vẽ, với GID/CID/LID và bbox `x, y, w, h` | Chấm điểm, phân tích ngoài pipeline |
+| `run_info.json` | v3.0: phiên bản code (`git describe`), config đầy đủ, thời gian từng pha | Tái lập một lần chạy |
 | `videos/camX_global_tracking.mp4` | Video replay với nhãn | Kiểm tra trực quan |
 
 Nhãn video mặc định có dạng `GID: 7 | CID: 3 | LID: 28`. Segment index không hiện trên video để nhãn gọn, nhưng có đầy đủ trong CSV. Trước khi vẽ, pipeline tra mapping bằng `(camera, LID, frame)`, vì LID bị split có thể đổi CID/GID theo thời gian.
@@ -363,13 +444,15 @@ python main.py --config configs/config.yaml --output-directory outputs_fix_valid
 |---|---|---|
 | Detector | confidence, NMS IoU | Bỏ sót người hoặc nhiều box duplicate |
 | Detector tốc độ | `batch_size`, `half`, `image_size` | Hết VRAM thì giảm `batch_size`; cần kết quả FP32 thì `half: false` |
-| ByteTrack | buffer, match threshold | Occlusion, LID đứt/nhảy |
-| ReID | checkpoint, architecture, sample interval, crop size | Similarity kém hoặc chậm |
+| Tracker | `tracker.config_path` (BoT-SORT/ByteTrack), buffer, `proximity_thresh`, `appearance_thresh`, `backfill_first_frame` | Occlusion, LID đứt/nhảy |
+| ReID | checkpoint, architecture, `samples_per_second` (hoặc `sample_interval`), crop size | Similarity kém hoặc chậm |
 | ReID chất lượng | `flip_augmentation`, `max_occlusion`, `border_margin` | Split giả khi người bị che, descriptor lẫn người |
 | Render | `output.render_workers` | Số camera được render song song |
 | Track split | window, change threshold, separation | Một LID lẫn nhiều người hoặc split quá nhiều |
-| Intra camera | re-entry/duplicate thresholds | CID tách sai/gộp nhầm |
-| Cross camera | cosine threshold, time gap | GID false positive/false negative |
+| Intra camera | re-entry/duplicate thresholds, `motion_link_*` | CID tách sai/gộp nhầm |
+| Hậu xử lý | `postprocess.min_camera_track_frames` | Quá nhiều ID rác / mất người xuất hiện ngắn |
+| Cross camera | `method`, `similarity_mode`, `top_fraction`, cosine threshold, time gap | GID false positive/false negative |
+| Cache | `cache.enabled`, `cache.directory` | Tắt nếu muốn mỗi lần chạy đều chạy lại model |
 
 ## Kiểm thử hiệu chỉnh và giới hạn
 
@@ -379,8 +462,11 @@ python main.py --config configs/config.yaml --output-directory outputs_fix_valid
 | `scripts/test_tracker.py` | Kiểm tra độ liên tục Local ID |
 | `scripts/test_reid.py` | So similarity cùng người/khác người |
 | `scripts/test_matching.py` | Test Hungarian và GID không cần model |
+| `scripts/test_global_association.py` | Test phân cụm agglomerative: cùng người nhiều camera, không gộp cùng camera, không bắc cầu, ràng buộc thời gian |
+| `scripts/test_backfill.py` | Test frame đầu bị Ultralytics bỏ và được ghi bù; BoT-SORT với feature OSNet |
+| `benchmarks/test_metrics.py` | Test MOTA/IDF1/HOTA trên các ca tính tay |
 | `scripts/test_track_segmenter.py` | Test ID switch phải split, thay góc ngắn không split, bị che ngắn không split, `crop_quality` |
-| `scripts/test_intra_camera.py` | Test re-entry, duplicate overlap, người thật đồng thời |
+| `scripts/test_intra_camera.py` | Test re-entry, duplicate overlap, người thật đồng thời, motion link |
 | `scripts/test_duplicate_detection.py` | Regression NMS tại cam5 frame 3255 |
 
 Quy trình tuning nên dựa trên dữ liệu:
@@ -393,10 +479,23 @@ Quy trình tuning nên dựa trên dữ liệu:
 Những giới hạn cần biết:
 
 - ReID dựa appearance nên có thể nhầm người mặc giống nhau, bị che hoặc ở ánh sáng rất khác.
-- ByteTrack trong project không dùng appearance trực tiếp; repair diễn ra offline, không đổi LID thô.
-- Pairwise Hungarian không phải multi-camera association học end-to-end.
+- BoT-SORT chỉ dùng appearance cho cặp còn chồng nhau (`proximity_thresh`); người nhảy xa hoàn toàn giữa hai frame vẫn được nối ở bước motion link/re-entry offline.
+- Phân cụm agglomerative vẫn là heuristic dựa trên ngưỡng, không phải multi-camera association học end-to-end.
 - Ngưỡng không có giá trị đúng cho mọi camera; cần calibration theo checkpoint và môi trường.
 - Số thứ tự GID có thể thay đổi giữa các lần chạy nếu tập track/candidate match thay đổi. Quan hệ bên trong một lần chạy mới là ý nghĩa quan trọng.
+
+## Đánh giá và phiên bản
+
+Mỗi phiên bản là một git tag (`v1.0`, `v2.0`, `v2.1`, `v3.0`), phát triển trên nhánh `version/vX.Y`. Benchmark chấm mọi phiên bản trên cùng dữ liệu HDA có ground truth, bằng cùng code chấm điểm:
+
+```powershell
+python benchmarks/prepare_hda.py --hda-root ../HDA_Dataset_V1.3   # một lần
+python -m benchmarks.run_benchmark --name v3.0                    # chấm checkout hiện tại
+python -m benchmarks.report                                       # sinh docs/BENCHMARK_RESULTS.md
+python -m benchmarks.ablation                                     # sinh docs/ABLATION.md
+```
+
+Chi tiết phương pháp, chỉ số và quy trình phát hành phiên bản mới: [docs/EVALUATION.md](docs/EVALUATION.md).
 
 ## Cấu trúc project
 
@@ -405,8 +504,12 @@ Những giới hạn cần biết:
 |-- main.py
 |-- configs/
 |   |-- config.yaml
-|   `-- bytetrack.yaml
+|   |-- botsort.yaml          # v3.0 (mặc định)
+|   `-- bytetrack.yaml        # v2.x
+|-- benchmarks/               # Benchmark HDA, chỉ số, runner, báo cáo, ablation
+|-- docs/                     # Đánh giá, kết quả, ablation, changelog
 |-- data/raw/                 # Video đầu vào
+|-- data/benchmark/           # Dữ liệu HDA đã chuẩn bị (không commit)
 |-- models/detector/          # YOLO checkpoint local
 |-- models/reid/              # OSNet checkpoint local
 |-- scripts/                  # Các regression/unit test
