@@ -12,3 +12,8 @@ outputs/
 
 .ipynb_checkpoints/
 .pytest_cache/
+outputs_*/
+!outputs_fix_validation/
+.kilo/
+benchmarks/runs/
+data/benchmark/
